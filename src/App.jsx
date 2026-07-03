@@ -61,28 +61,58 @@ export default function SubscriptionManager() {
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState({ name: "", price: "", day: "", cycle: "monthly", month: "" });
   const loaded = useRef(false);
+  const initStarted = useRef(false);
   const saveTimer = useRef(null);
 
   // ---- 読み込み ----
   useEffect(() => {
+    // StrictMode の二重実行ガード(ハッシュ消費が1回きりのため必須)
+    if (initStarted.current) return;
+    initStarted.current = true;
     (async () => {
+      let subs0 = [];
+      let checked0 = [];
       try {
         const result = await storage.get(STORAGE_KEY);
         if (result && result.value) {
           const data = JSON.parse(result.value);
           // 旧データ(cycle なし)は月払いとして扱う
-          const migrated = (Array.isArray(data.subs) ? data.subs : []).map((s) =>
+          subs0 = (Array.isArray(data.subs) ? data.subs : []).map((s) =>
             s.cycle ? s : { ...s, cycle: "monthly" }
           );
-          setSubs(migrated);
-          setChecked(Array.isArray(data.checked) ? data.checked : []);
+          checked0 = Array.isArray(data.checked) ? data.checked : [];
         }
       } catch (e) {
         // 初回起動(キー未作成)は空でOK
-      } finally {
-        loaded.current = true;
-        setLoading(false);
       }
+      // ---- URL からの取り込み(#import=<base64url JSON>)----
+      // 同じ id は取り込まないので、リンクを複数回開いても重複しない
+      try {
+        const m = window.location.hash.match(/^#import=([A-Za-z0-9\-_]+)$/);
+        if (m) {
+          const json = decodeURIComponent(escape(atob(m[1].replace(/-/g, "+").replace(/_/g, "/"))));
+          const payload = JSON.parse(json);
+          const existing = new Set(subs0.map((s) => s.id));
+          const incoming = (Array.isArray(payload.subs) ? payload.subs : []).filter(
+            (s) =>
+              s && typeof s.id === "string" && !existing.has(s.id) &&
+              typeof s.name === "string" && s.name.trim() &&
+              Number.isFinite(s.price) && s.price >= 0 &&
+              Number.isInteger(s.day) && s.day >= 1 && s.day <= 31 &&
+              (s.cycle === "monthly" ||
+                (s.cycle === "yearly" && Number.isInteger(s.month) && s.month >= 1 && s.month <= 12))
+          );
+          subs0 = [...subs0, ...incoming];
+          checked0 = [...checked0, ...incoming.map((s) => s.id)];
+          window.history.replaceState(null, "", window.location.pathname + window.location.search);
+        }
+      } catch (e) {
+        // 壊れたインポートデータは無視
+      }
+      setSubs(subs0);
+      setChecked(checked0);
+      loaded.current = true;
+      setLoading(false);
     })();
   }, []);
 
