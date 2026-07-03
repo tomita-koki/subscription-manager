@@ -7,8 +7,10 @@
 
 ## 機能
 
-- サブスクの登録・編集・削除(サービス名 / 月額 / 引き落とし日)
+- サブスクの登録・編集・削除(サービス名 / 金額 / 引き落とし日)
+- 月払い・年払いの両方に対応(年払いは月額換算で合計に反映)
 - チェックした項目だけの合計をヘッダーに常時表示(カウントアップ演出付き)
+- 選択中の年間コストも同時表示
 - 全体に対する選択割合のゲージ表示
 - 引き落としが近い順に自動ソート、7日以内は「あと◯日」バッジ
 - データはブラウザに自動保存(リロードしても消えない)
@@ -30,6 +32,8 @@ npm run build    # dist/ に出力
 
 ## デプロイ
 
-静的サイトとしてどこでも動きます(Vercel / Netlify / GitHub Pages)。
+`main` に push すると GitHub Actions(`.github/workflows/deploy.yml`)が自動で
+GitHub Pages にデプロイします。`vite.config.js` の `base` は Actions 上のビルドでのみ
+`/subscription-manager/` に切り替わるため、ローカル開発はルートパスのままです。
 
-GitHub Pages の場合は `vite.config.js` に `base: "/subscription-manager/"` を追加してください。
+静的サイトなので Vercel / Netlify などでもそのまま動きます。

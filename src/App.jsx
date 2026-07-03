@@ -27,15 +27,29 @@ function useCountUp(target, dur = 450) {
   return val;
 }
 
-const yen = (n) => "¥" + Number(n || 0).toLocaleString("ja-JP");
+const yen = (n) => "¥" + Math.round(Number(n || 0)).toLocaleString("ja-JP");
 
-// 今日から次の引き落としまでの日数
-function daysUntil(day) {
+// 月額換算(年払いは12分割)
+const monthlyOf = (s) => (s.cycle === "yearly" ? s.price / 12 : s.price);
+const yearlyOf = (s) => (s.cycle === "yearly" ? s.price : s.price * 12);
+
+// 今日から次の引き落としまでの日数(31日など存在しない日は月末に丸める)
+function daysUntil(s) {
   const now = new Date();
-  const today = now.getDate();
-  if (day >= today) return day - today;
-  const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-  return lastDay - today + day;
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const clamp = (y, m) => {
+    const last = new Date(y, m + 1, 0).getDate();
+    return new Date(y, m, Math.min(s.day, last));
+  };
+  let next;
+  if (s.cycle === "yearly") {
+    next = clamp(now.getFullYear(), s.month - 1);
+    if (next < today) next = clamp(now.getFullYear() + 1, s.month - 1);
+  } else {
+    next = clamp(now.getFullYear(), now.getMonth());
+    if (next < today) next = clamp(now.getFullYear(), now.getMonth() + 1);
+  }
+  return Math.round((next - today) / 86400000);
 }
 
 export default function SubscriptionManager() {
@@ -45,7 +59,7 @@ export default function SubscriptionManager() {
   const [saveState, setSaveState] = useState("idle");
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState(null);
-  const [form, setForm] = useState({ name: "", price: "", day: "" });
+  const [form, setForm] = useState({ name: "", price: "", day: "", cycle: "monthly", month: "" });
   const loaded = useRef(false);
   const saveTimer = useRef(null);
 
@@ -56,7 +70,11 @@ export default function SubscriptionManager() {
         const result = await storage.get(STORAGE_KEY);
         if (result && result.value) {
           const data = JSON.parse(result.value);
-          setSubs(Array.isArray(data.subs) ? data.subs : []);
+          // 旧データ(cycle なし)は月払いとして扱う
+          const migrated = (Array.isArray(data.subs) ? data.subs : []).map((s) =>
+            s.cycle ? s : { ...s, cycle: "monthly" }
+          );
+          setSubs(migrated);
           setChecked(Array.isArray(data.checked) ? data.checked : []);
         }
       } catch (e) {
@@ -86,18 +104,25 @@ export default function SubscriptionManager() {
   }, [subs, checked]);
 
   // ---- 操作 ----
-  const openAdd = () => { setEditingId(null); setForm({ name: "", price: "", day: "" }); setShowForm(true); };
-  const openEdit = (s) => { setEditingId(s.id); setForm({ name: s.name, price: String(s.price), day: String(s.day) }); setShowForm(true); };
+  const openAdd = () => { setEditingId(null); setForm({ name: "", price: "", day: "", cycle: "monthly", month: "" }); setShowForm(true); };
+  const openEdit = (s) => {
+    setEditingId(s.id);
+    setForm({ name: s.name, price: String(s.price), day: String(s.day), cycle: s.cycle, month: s.cycle === "yearly" ? String(s.month) : "" });
+    setShowForm(true);
+  };
   const submit = () => {
     const name = form.name.trim();
     const price = parseInt(form.price, 10);
     const day = parseInt(form.day, 10);
+    const month = parseInt(form.month, 10);
     if (!name || isNaN(price) || price < 0 || isNaN(day) || day < 1 || day > 31) return;
+    if (form.cycle === "yearly" && (isNaN(month) || month < 1 || month > 12)) return;
+    const entry = { name, price, day, cycle: form.cycle, ...(form.cycle === "yearly" ? { month } : {}) };
     if (editingId) {
-      setSubs((p) => p.map((s) => (s.id === editingId ? { ...s, name, price, day } : s)));
+      setSubs((p) => p.map((s) => (s.id === editingId ? { id: s.id, ...entry } : s)));
     } else {
       const id = crypto.randomUUID();
-      setSubs((p) => [...p, { id, name, price, day }]);
+      setSubs((p) => [...p, { id, ...entry }]);
       setChecked((p) => [...p, id]); // 追加時はデフォルトで合計に含める
     }
     setShowForm(false);
@@ -106,11 +131,13 @@ export default function SubscriptionManager() {
   const toggle = (id) => setChecked((p) => (p.includes(id) ? p.filter((c) => c !== id) : [...p, id]));
   const toggleAll = () => setChecked((p) => (p.length === subs.length ? [] : subs.map((s) => s.id)));
 
-  const selectedTotal = subs.filter((s) => checked.includes(s.id)).reduce((a, s) => a + s.price, 0);
-  const grandTotal = subs.reduce((a, s) => a + s.price, 0);
-  const animated = useCountUp(selectedTotal);
+  const selected = subs.filter((s) => checked.includes(s.id));
+  const selectedTotal = selected.reduce((a, s) => a + monthlyOf(s), 0);
+  const selectedYearly = selected.reduce((a, s) => a + yearlyOf(s), 0);
+  const grandTotal = subs.reduce((a, s) => a + monthlyOf(s), 0);
+  const animated = useCountUp(Math.round(selectedTotal));
   const ratio = grandTotal > 0 ? selectedTotal / grandTotal : 0;
-  const sorted = [...subs].sort((a, b) => daysUntil(a.day) - daysUntil(b.day));
+  const sorted = [...subs].sort((a, b) => daysUntil(a) - daysUntil(b));
 
   const css = `
     .sm{--bg:#0C0D12;--sur:#14161E;--sur2:#1B1E29;--line:#262A36;--txt:#EDEEF2;--mut:#7D8190;
@@ -165,12 +192,13 @@ export default function SubscriptionManager() {
     .on .sm-chk svg{opacity:1;transform:scale(1)}
     .sm-info{flex:1;min-width:0}
     .sm-name{font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    .sm-meta{display:flex;align-items:center;gap:8px;margin-top:4px}
+    .sm-meta{display:flex;align-items:center;gap:6px;margin-top:4px;flex-wrap:wrap}
     .sm-daybadge{font-size:10px;padding:2px 8px;border-radius:99px;background:var(--sur2);
-      border:1px solid var(--line);color:var(--mut);letter-spacing:.04em}
+      border:1px solid var(--line);color:var(--mut);letter-spacing:.04em;white-space:nowrap}
     .sm-soon{color:#FFB88C;border-color:rgba(255,184,140,.35);background:rgba(255,184,140,.08)}
-    .sm-price{font-size:17px;font-weight:600;white-space:nowrap}
+    .sm-price{font-size:17px;font-weight:600;white-space:nowrap;text-align:right}
     .sm-price small{font-size:10px;color:var(--mut);font-weight:400;margin-left:2px}
+    .sm-permo{font-size:10px;color:var(--mut);font-weight:400;margin-top:2px}
     .sm-acts{display:flex;flex-direction:column;gap:2px;flex-shrink:0}
     .sm-ic{background:none;border:none;color:var(--mut);cursor:pointer;padding:4px 8px;
       font-size:11px;border-radius:6px;font-family:inherit}
@@ -192,6 +220,11 @@ export default function SubscriptionManager() {
     .sm-input:focus{outline:2px solid var(--acc);outline-offset:-1px;border-color:transparent}
     .sm-frow{display:flex;gap:10px}
     .sm-frow .sm-field{flex:1}
+    /* 支払いサイクル切替 */
+    .sm-seg{display:flex;gap:4px;padding:3px;background:var(--bg);border:1px solid var(--line);border-radius:10px}
+    .sm-segbtn{flex:1;padding:9px;border:none;border-radius:8px;background:none;color:var(--mut);
+      font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .18s}
+    .sm-segbtn.on{background:var(--sur2);color:var(--txt);box-shadow:0 0 0 1px var(--acc2),0 0 14px -6px var(--glow)}
     .sm-btns{display:flex;gap:8px;margin-top:8px}
     .sm-primary{flex:1;padding:12px;border:none;border-radius:10px;
       background:linear-gradient(120deg,var(--acc2),var(--acc));color:#fff;
@@ -234,7 +267,7 @@ export default function SubscriptionManager() {
             <div>
               <div className="sm-tlabel">選択中の合計 / {checked.length}件</div>
               <div className="sm-total mono">{yen(animated)}</div>
-              <div className="sm-tsub mono">全体 {yen(grandTotal)} / 月</div>
+              <div className="sm-tsub mono">年間 {yen(selectedYearly)}・全体 {yen(grandTotal)} / 月</div>
             </div>
           </div>
           <div className="sm-gauge" aria-hidden="true">
@@ -260,8 +293,9 @@ export default function SubscriptionManager() {
         )}
 
         {sorted.map((s) => {
-          const d = daysUntil(s.day);
+          const d = daysUntil(s);
           const on = checked.includes(s.id);
+          const yearly = s.cycle === "yearly";
           return (
             <div
               key={s.id}
@@ -281,12 +315,15 @@ export default function SubscriptionManager() {
                 <div className="sm-name">{s.name}</div>
                 <div className="sm-meta">
                   <span className={"sm-daybadge mono" + (d <= 7 ? " sm-soon" : "")}>
-                    毎月{s.day}日{d === 0 ? "・今日" : d <= 7 ? `・あと${d}日` : ""}
+                    {yearly ? `毎年${s.month}月${s.day}日` : `毎月${s.day}日`}
+                    {d === 0 ? "・今日" : d <= 7 ? `・あと${d}日` : ""}
                   </span>
+                  {yearly && <span className="sm-daybadge">年払い</span>}
                 </div>
               </div>
               <div className="sm-price mono">
-                {yen(s.price)}<small>/月</small>
+                {yen(s.price)}<small>/{yearly ? "年" : "月"}</small>
+                {yearly && <div className="sm-permo mono">月あたり {yen(monthlyOf(s))}</div>}
               </div>
               <div className="sm-acts" onClick={(e) => e.stopPropagation()}>
                 <button className="sm-ic" onClick={() => openEdit(s)}>編集</button>
@@ -309,17 +346,46 @@ export default function SubscriptionManager() {
                 autoFocus
               />
             </div>
+            <div className="sm-field">
+              <label className="sm-label">支払いサイクル</label>
+              <div className="sm-seg" role="radiogroup" aria-label="支払いサイクル">
+                {[["monthly", "月払い"], ["yearly", "年払い"]].map(([v, label]) => (
+                  <button
+                    key={v}
+                    type="button"
+                    role="radio"
+                    aria-checked={form.cycle === v}
+                    className={"sm-segbtn" + (form.cycle === v ? " on" : "")}
+                    onClick={() => setForm({ ...form, cycle: v })}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <div className="sm-frow">
               <div className="sm-field">
-                <label className="sm-label">月額(円)</label>
+                <label className="sm-label">{form.cycle === "yearly" ? "年額(円)" : "月額(円)"}</label>
                 <input
                   className="sm-input mono"
                   type="number" min="0"
                   value={form.price}
                   onChange={(e) => setForm({ ...form, price: e.target.value })}
-                  placeholder="1490"
+                  placeholder={form.cycle === "yearly" ? "13800" : "1490"}
                 />
               </div>
+              {form.cycle === "yearly" && (
+                <div className="sm-field">
+                  <label className="sm-label">引き落とし月(1〜12)</label>
+                  <input
+                    className="sm-input mono"
+                    type="number" min="1" max="12"
+                    value={form.month}
+                    onChange={(e) => setForm({ ...form, month: e.target.value })}
+                    placeholder="4"
+                  />
+                </div>
+              )}
               <div className="sm-field">
                 <label className="sm-label">引き落とし日(1〜31)</label>
                 <input
