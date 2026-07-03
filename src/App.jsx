@@ -33,6 +33,11 @@ const yen = (n) => "¥" + Math.round(Number(n || 0)).toLocaleString("ja-JP");
 const monthlyOf = (s) => (s.cycle === "yearly" ? s.price / 12 : s.price);
 const yearlyOf = (s) => (s.cycle === "yearly" ? s.price : s.price * 12);
 
+// 全データを #import= 用の base64url に変換(別端末への共有リンク)
+const toImportHash = (subs) =>
+  btoa(unescape(encodeURIComponent(JSON.stringify({ subs }))))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
 // 今日から次の引き落としまでの日数(31日など存在しない日は月末に丸める)
 function daysUntil(s) {
   const now = new Date();
@@ -58,6 +63,7 @@ export default function SubscriptionManager() {
   const [loading, setLoading] = useState(true);
   const [saveState, setSaveState] = useState("idle");
   const [showForm, setShowForm] = useState(false);
+  const [shareState, setShareState] = useState("idle");
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState({ name: "", price: "", day: "", cycle: "monthly", month: "" });
   const loaded = useRef(false);
@@ -86,24 +92,26 @@ export default function SubscriptionManager() {
         // 初回起動(キー未作成)は空でOK
       }
       // ---- URL からの取り込み(#import=<base64url JSON>)----
-      // 同じ id は取り込まないので、リンクを複数回開いても重複しない
+      // 同じ id は上書き更新、新しい id は追加(重複はしない)
       try {
         const m = window.location.hash.match(/^#import=([A-Za-z0-9\-_]+)$/);
         if (m) {
           const json = decodeURIComponent(escape(atob(m[1].replace(/-/g, "+").replace(/_/g, "/"))));
           const payload = JSON.parse(json);
-          const existing = new Set(subs0.map((s) => s.id));
           const incoming = (Array.isArray(payload.subs) ? payload.subs : []).filter(
             (s) =>
-              s && typeof s.id === "string" && !existing.has(s.id) &&
+              s && typeof s.id === "string" &&
               typeof s.name === "string" && s.name.trim() &&
               Number.isFinite(s.price) && s.price >= 0 &&
               Number.isInteger(s.day) && s.day >= 1 && s.day <= 31 &&
               (s.cycle === "monthly" ||
                 (s.cycle === "yearly" && Number.isInteger(s.month) && s.month >= 1 && s.month <= 12))
           );
-          subs0 = [...subs0, ...incoming];
-          checked0 = [...checked0, ...incoming.map((s) => s.id)];
+          const existing = new Set(subs0.map((s) => s.id));
+          const byId = new Map(subs0.map((s) => [s.id, s]));
+          for (const s of incoming) byId.set(s.id, s);
+          subs0 = [...byId.values()];
+          checked0 = [...checked0, ...incoming.filter((s) => !existing.has(s.id)).map((s) => s.id)];
           window.history.replaceState(null, "", window.location.pathname + window.location.search);
         }
       } catch (e) {
@@ -160,6 +168,18 @@ export default function SubscriptionManager() {
   const remove = (id) => { setSubs((p) => p.filter((s) => s.id !== id)); setChecked((p) => p.filter((c) => c !== id)); };
   const toggle = (id) => setChecked((p) => (p.includes(id) ? p.filter((c) => c !== id) : [...p, id]));
   const toggleAll = () => setChecked((p) => (p.length === subs.length ? [] : subs.map((s) => s.id)));
+  const copyShareLink = async () => {
+    const url = window.location.origin + window.location.pathname + "#import=" + toImportHash(subs);
+    try {
+      await navigator.clipboard.writeText(url);
+      setShareState("copied");
+    } catch (e) {
+      window.prompt("このリンクを別端末で開くと同じデータになります", url);
+      setShareState("idle");
+      return;
+    }
+    setTimeout(() => setShareState("idle"), 2000);
+  };
 
   const selected = subs.filter((s) => checked.includes(s.id));
   const selectedTotal = selected.reduce((a, s) => a + monthlyOf(s), 0);
@@ -310,9 +330,14 @@ export default function SubscriptionManager() {
         {subs.length > 0 && (
           <div className="sm-bar">
             <span className="sm-count">{subs.length}件・引き落としが近い順</span>
-            <button className="sm-link" onClick={toggleAll}>
-              {checked.length === subs.length ? "全て解除" : "全て選択"}
-            </button>
+            <span>
+              <button className="sm-link" onClick={copyShareLink}>
+                {shareState === "copied" ? "✓ コピーしました" : "共有リンク"}
+              </button>
+              <button className="sm-link" onClick={toggleAll}>
+                {checked.length === subs.length ? "全て解除" : "全て選択"}
+              </button>
+            </span>
           </div>
         )}
 
