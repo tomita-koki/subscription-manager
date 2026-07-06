@@ -1,7 +1,15 @@
 import { useState, useEffect, useRef } from "react";
 import { storage } from "./storage.js";
+import {
+  TOKEN_URL, loadSyncConfig, saveSyncConfig, clearSyncConfig,
+  toSyncHash, parseSyncHash, findRemote, createRemote, pullRemote, pushRemote,
+} from "./sync.js";
 
 const STORAGE_KEY = "subman:data";
+
+// 旧データ(cycle なし)は月払いとして扱う
+const normalizeSubs = (arr) =>
+  (Array.isArray(arr) ? arr : []).map((s) => (s.cycle ? s : { ...s, cycle: "monthly" }));
 
 // ---- 金額カウントアップ ----
 function useCountUp(target, dur = 450) {
@@ -66,9 +74,46 @@ export default function SubscriptionManager() {
   const [shareState, setShareState] = useState("idle");
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState({ name: "", price: "", day: "", cycle: "monthly", month: "" });
+  const [syncCfg, setSyncCfg] = useState(null);
+  const [syncState, setSyncState] = useState("off"); // off | syncing | ok | error
+  const [showSync, setShowSync] = useState(false);
+  const [tokenInput, setTokenInput] = useState("");
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncError, setSyncError] = useState("");
+  const [deviceLinkState, setDeviceLinkState] = useState("idle");
   const loaded = useRef(false);
   const initStarted = useRef(false);
   const saveTimer = useRef(null);
+  const syncCfgRef = useRef(null);
+  const updatedAtRef = useRef(0); // データの最終更新時刻(LWW の比較キー)
+  const changeSrcRef = useRef("idle"); // "user" のときだけリモートへ push(同期ループ防止)
+  const lastPullAtRef = useRef(0);
+  syncCfgRef.current = syncCfg;
+
+  // pull → 新しい方を採用 → ローカルが新しければ push(双方向の突き合わせ)
+  const reconcile = async (localOverride, cfgOverride) => {
+    const cfg = cfgOverride || syncCfgRef.current;
+    if (!cfg) return;
+    lastPullAtRef.current = Date.now();
+    setSyncState("syncing");
+    try {
+      const remote = await pullRemote(cfg);
+      if (remote && remote.updatedAt > updatedAtRef.current) {
+        changeSrcRef.current = "remote";
+        updatedAtRef.current = remote.updatedAt;
+        setSubs(normalizeSubs(remote.subs));
+        setChecked(remote.checked);
+      } else if (!remote || remote.updatedAt < updatedAtRef.current) {
+        const local = localOverride || { subs, checked };
+        await pushRemote(cfg, { ...local, updatedAt: updatedAtRef.current });
+      }
+      setSyncState("ok");
+    } catch (e) {
+      setSyncState("error");
+    }
+  };
+  const reconcileRef = useRef(reconcile);
+  reconcileRef.current = reconcile;
 
   // ---- 読み込み ----
   useEffect(() => {
@@ -78,15 +123,23 @@ export default function SubscriptionManager() {
     (async () => {
       let subs0 = [];
       let checked0 = [];
+      let updatedAt0 = 0;
+      // ---- 同期への参加(#sync=<base64url {t,g}>)----
+      // PC で発行した「別の端末を追加」リンクをスマホで開くと、この端末も同期に加わる
+      let cfg = parseSyncHash(window.location.hash);
+      if (cfg) {
+        saveSyncConfig(cfg);
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      } else {
+        cfg = loadSyncConfig();
+      }
       try {
         const result = await storage.get(STORAGE_KEY);
         if (result && result.value) {
           const data = JSON.parse(result.value);
-          // 旧データ(cycle なし)は月払いとして扱う
-          subs0 = (Array.isArray(data.subs) ? data.subs : []).map((s) =>
-            s.cycle ? s : { ...s, cycle: "monthly" }
-          );
+          subs0 = normalizeSubs(data.subs);
           checked0 = Array.isArray(data.checked) ? data.checked : [];
+          updatedAt0 = Number(data.updatedAt) || 0;
         }
       } catch (e) {
         // 初回起動(キー未作成)は空でOK
@@ -113,35 +166,76 @@ export default function SubscriptionManager() {
           subs0 = [...byId.values()];
           checked0 = [...checked0, ...incoming.filter((s) => !existing.has(s.id)).map((s) => s.id)];
           window.history.replaceState(null, "", window.location.pathname + window.location.search);
+          if (incoming.length) {
+            changeSrcRef.current = "user"; // 取り込んだ内容は同期先にも push する
+            updatedAt0 = Date.now();
+          }
         }
       } catch (e) {
         // 壊れたインポートデータは無視
       }
+      updatedAtRef.current = updatedAt0;
       setSubs(subs0);
       setChecked(checked0);
       loaded.current = true;
       setLoading(false);
+      // リモートとの突き合わせは画面表示後にバックグラウンドで行う
+      if (cfg) {
+        setSyncCfg(cfg);
+        reconcileRef.current({ subs: subs0, checked: checked0 }, cfg);
+      }
     })();
   }, []);
 
-  // ---- 自動保存 ----
+  // ---- 定期的な取り込み(タブ復帰時+60秒ごと)----
+  useEffect(() => {
+    if (!syncCfg) return;
+    const kick = () => {
+      if (document.hidden) return;
+      if (Date.now() - lastPullAtRef.current < 10000) return;
+      reconcileRef.current();
+    };
+    window.addEventListener("focus", kick);
+    document.addEventListener("visibilitychange", kick);
+    const iv = setInterval(kick, 60000);
+    return () => {
+      window.removeEventListener("focus", kick);
+      document.removeEventListener("visibilitychange", kick);
+      clearInterval(iv);
+    };
+  }, [syncCfg]);
+
+  // ---- 自動保存(ユーザー操作なら同期先にも push)----
   useEffect(() => {
     if (!loaded.current) return;
+    const fromUser = changeSrcRef.current === "user";
+    changeSrcRef.current = "idle";
+    if (fromUser) updatedAtRef.current = Date.now();
     setSaveState("saving");
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       try {
-        await storage.set(STORAGE_KEY, JSON.stringify({ subs, checked }));
+        await storage.set(STORAGE_KEY, JSON.stringify({ subs, checked, updatedAt: updatedAtRef.current }));
         setSaveState("saved");
         setTimeout(() => setSaveState("idle"), 1600);
       } catch (e) {
         setSaveState("error");
+      }
+      if (fromUser && syncCfgRef.current) {
+        setSyncState("syncing");
+        try {
+          await pushRemote(syncCfgRef.current, { subs, checked, updatedAt: updatedAtRef.current });
+          setSyncState("ok");
+        } catch (e) {
+          setSyncState("error");
+        }
       }
     }, 500);
     return () => clearTimeout(saveTimer.current);
   }, [subs, checked]);
 
   // ---- 操作 ----
+  const markUser = () => { changeSrcRef.current = "user"; };
   const openAdd = () => { setEditingId(null); setForm({ name: "", price: "", day: "", cycle: "monthly", month: "" }); setShowForm(true); };
   const openEdit = (s) => {
     setEditingId(s.id);
@@ -156,6 +250,7 @@ export default function SubscriptionManager() {
     if (!name || isNaN(price) || price < 0 || isNaN(day) || day < 1 || day > 31) return;
     if (form.cycle === "yearly" && (isNaN(month) || month < 1 || month > 12)) return;
     const entry = { name, price, day, cycle: form.cycle, ...(form.cycle === "yearly" ? { month } : {}) };
+    markUser();
     if (editingId) {
       setSubs((p) => p.map((s) => (s.id === editingId ? { id: s.id, ...entry } : s)));
     } else {
@@ -165,9 +260,9 @@ export default function SubscriptionManager() {
     }
     setShowForm(false);
   };
-  const remove = (id) => { setSubs((p) => p.filter((s) => s.id !== id)); setChecked((p) => p.filter((c) => c !== id)); };
-  const toggle = (id) => setChecked((p) => (p.includes(id) ? p.filter((c) => c !== id) : [...p, id]));
-  const toggleAll = () => setChecked((p) => (p.length === subs.length ? [] : subs.map((s) => s.id)));
+  const remove = (id) => { markUser(); setSubs((p) => p.filter((s) => s.id !== id)); setChecked((p) => p.filter((c) => c !== id)); };
+  const toggle = (id) => { markUser(); setChecked((p) => (p.includes(id) ? p.filter((c) => c !== id) : [...p, id])); };
+  const toggleAll = () => { markUser(); setChecked((p) => (p.length === subs.length ? [] : subs.map((s) => s.id))); };
   const copyShareLink = async () => {
     const url = window.location.origin + window.location.pathname + "#import=" + toImportHash(subs);
     try {
@@ -179,6 +274,58 @@ export default function SubscriptionManager() {
       return;
     }
     setTimeout(() => setShareState("idle"), 2000);
+  };
+
+  // ---- 同期の開始(1台目・トークンを入力)----
+  const startSync = async () => {
+    const token = tokenInput.trim();
+    if (!token) return;
+    setSyncBusy(true);
+    setSyncError("");
+    try {
+      let gistId = await findRemote(token); // 別端末で作成済みの Gist があれば再利用
+      let cfg;
+      if (gistId) {
+        cfg = { token, gistId };
+        saveSyncConfig(cfg);
+        setSyncCfg(cfg);
+        await reconcile({ subs, checked }, cfg);
+      } else {
+        if (!updatedAtRef.current) updatedAtRef.current = Date.now();
+        gistId = await createRemote(token, { subs, checked, updatedAt: updatedAtRef.current });
+        cfg = { token, gistId };
+        saveSyncConfig(cfg);
+        setSyncCfg(cfg);
+        setSyncState("ok");
+      }
+      setTokenInput("");
+    } catch (e) {
+      setSyncError(
+        e.status === 401
+          ? "トークンが無効です。「gist」権限が付いているか・有効期限内かを確認してください。"
+          : "接続に失敗しました。通信環境を確認してもう一度お試しください。"
+      );
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const stopSync = () => {
+    clearSyncConfig();
+    setSyncCfg(null);
+    setSyncState("off");
+  };
+
+  // 2台目以降はこのリンクを開くだけで同期に参加できる
+  const copyDeviceLink = async () => {
+    const url = window.location.origin + window.location.pathname + toSyncHash(syncCfg);
+    try {
+      await navigator.clipboard.writeText(url);
+      setDeviceLinkState("copied");
+      setTimeout(() => setDeviceLinkState("idle"), 2000);
+    } catch (e) {
+      window.prompt("このリンクを追加したい端末で開いてください", url);
+    }
   };
 
   const selected = subs.filter((s) => checked.includes(s.id));
@@ -209,6 +356,14 @@ export default function SubscriptionManager() {
     .sm-brand{font-size:12px;font-weight:700;letter-spacing:.18em;color:var(--mut)}
     .sm-save{font-size:10px;color:var(--mut);letter-spacing:.08em;margin-top:4px;min-height:14px}
     .sm-save.err{color:#FF7B6B}
+    .sm-syncbtn{background:none;border:none;padding:2px 0;margin-top:2px;font-family:inherit;
+      font-size:11px;color:var(--acc);cursor:pointer;letter-spacing:.04em;text-align:left}
+    .sm-syncbtn.err{color:#FF7B6B}
+    .sm-note{font-size:12px;color:var(--mut);line-height:1.9;margin:0 0 14px}
+    .sm-note a{color:var(--acc)}
+    .sm-warn{font-size:11px;color:#FFB88C;line-height:1.7;margin:8px 0 12px}
+    .sm-syncstate{font-size:12px;color:var(--mut);margin:0 0 14px}
+    .sm-primary:disabled{opacity:.5;cursor:default}
     .sm-tlabel{font-size:10px;color:var(--mut);letter-spacing:.14em;text-align:right}
     .sm-total{font-size:34px;font-weight:600;line-height:1.1;text-align:right;
       background:linear-gradient(120deg,#EDEEF2 30%,var(--acc) 100%);
@@ -313,6 +468,15 @@ export default function SubscriptionManager() {
                 {saveState === "saved" && "✓ 保存済み"}
                 {saveState === "error" && <span className="err">保存に失敗しました</span>}
               </div>
+              <button
+                className={"sm-syncbtn" + (syncCfg && syncState === "error" ? " err" : "")}
+                onClick={() => setShowSync((v) => !v)}
+              >
+                {!syncCfg && "端末間の同期を設定"}
+                {syncCfg && syncState === "error" && "⚠ 同期エラー"}
+                {syncCfg && syncState === "syncing" && "↻ 同期中…"}
+                {syncCfg && (syncState === "ok" || syncState === "off") && "✓ 端末間で同期中"}
+              </button>
             </div>
             <div>
               <div className="sm-tlabel">選択中の合計 / {checked.length}件</div>
@@ -327,6 +491,68 @@ export default function SubscriptionManager() {
       </header>
 
       <main className="sm-main">
+        {showSync && (
+          <div className="sm-form" style={{ marginTop: 0, marginBottom: 16 }}>
+            <h3>端末間の同期</h3>
+            {!syncCfg ? (
+              <>
+                <p className="sm-note">
+                  GitHub の非公開 Gist にデータを保存して、スマホと PC で同じデータを表示します。
+                  <br />
+                  1.{" "}
+                  <a href={TOKEN_URL} target="_blank" rel="noreferrer">
+                    GitHub でアクセストークンを作成
+                  </a>
+                  (権限は「gist」のみ。リンク先で設定済み)
+                  <br />
+                  2. 生成されたトークン(ghp_…)を下に貼り付けて「同期を開始」
+                  <br />
+                  3. 開始後に表示される「別の端末を追加」リンクをスマホで開く
+                </p>
+                <div className="sm-field">
+                  <label className="sm-label">アクセストークン</label>
+                  <input
+                    className="sm-input mono"
+                    type="password"
+                    value={tokenInput}
+                    onChange={(e) => setTokenInput(e.target.value)}
+                    placeholder="ghp_xxxxxxxxxxxx"
+                  />
+                </div>
+                {syncError && <p className="sm-warn">{syncError}</p>}
+                <div className="sm-btns">
+                  <button className="sm-primary" onClick={startSync} disabled={syncBusy || !tokenInput.trim()}>
+                    {syncBusy ? "接続中…" : "同期を開始"}
+                  </button>
+                  <button className="sm-ghost" onClick={() => setShowSync(false)}>閉じる</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="sm-syncstate">
+                  {syncState === "error"
+                    ? "⚠ 同期に失敗しました。通信環境とトークンの有効期限を確認してください。"
+                    : "✓ この端末は同期中です。変更は自動で他の端末にも反映されます。"}
+                </p>
+                <div className="sm-btns">
+                  <button className="sm-primary" onClick={copyDeviceLink}>
+                    {deviceLinkState === "copied" ? "✓ コピーしました" : "別の端末を追加(リンクをコピー)"}
+                  </button>
+                </div>
+                <p className="sm-warn">
+                  このリンクを開いた端末が同期に参加します。同期用トークンを含むため、
+                  自分宛てのメモや AirDrop など安全な方法で送ってください。
+                </p>
+                <div className="sm-btns">
+                  <button className="sm-ghost" onClick={() => reconcile()}>今すぐ同期</button>
+                  <button className="sm-ghost" onClick={stopSync}>同期を解除</button>
+                  <button className="sm-ghost" onClick={() => setShowSync(false)}>閉じる</button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
         {subs.length > 0 && (
           <div className="sm-bar">
             <span className="sm-count">{subs.length}件・引き落としが近い順</span>
